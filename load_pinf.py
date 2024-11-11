@@ -72,27 +72,31 @@ def load_pinf_frame_data(basedir, half_res="normal", testskip=1):
 
     # read video frames
     # all videos should be synchronized, having the same frame_rate and frame_num
+    frame_nums = 120
     for s in "train,val,test".split(","):
         if s == "train" or testskip == 0:
             skip = 1
         else:
             skip = testskip
 
-        video_list = meta[s + "_videos"] if (s + "_videos") in meta else meta["train_videos"][0:1]
+        video_list = meta[s + "_videos"]
+        video_list = video_list[0:1]
+        if s == "test":
+            video_list = video_list[2:3]
 
         for train_video in video_list:
             imgs = []
             poses = []
             time_steps = []
             H, W, Focal = 0, 0, 0
-
+            print("loading video: ", train_video["file_name"])
             f_name = os.path.join(basedir, train_video["file_name"])
 
             reader = imageio.get_reader(f_name, "ffmpeg")
             # if s=='train':
-            delta_t = 1.0 / train_video["frame_num"]
+            delta_t = 1.0 / frame_nums
 
-            for frame_i in range(0, train_video["frame_num"], skip):
+            for frame_i in range(0, frame_nums, skip):
                 reader.set_image_index(frame_i)
                 frame = reader.get_next_data()
 

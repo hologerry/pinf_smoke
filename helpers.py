@@ -256,16 +256,16 @@ def render_path(
         filename = os.path.join(savedir, "rgb_{:03d}.png".format(i))
         imageio.imwrite(filename, rgb8)
         # if savedir is not None:
-            # vel_mask = (rgbs[-1] > 0.1).any(-1)
-            # vel_map[450:] = 0
-            # if render_vel:
-            #     save_quiver_plot(
-            #         vel_map[..., 0].cpu().numpy() * vel_mask,
-            #         vel_map[..., 1].cpu().numpy() * vel_mask,
-            #         64,
-            #         os.path.join(savedir, "vel_{:03d}.png".format(i)),
-            #         scale=0.05,
-            #     )
+        # vel_mask = (rgbs[-1] > 0.1).any(-1)
+        # vel_map[450:] = 0
+        # if render_vel:
+        #     save_quiver_plot(
+        #         vel_map[..., 0].cpu().numpy() * vel_mask,
+        #         vel_map[..., 1].cpu().numpy() * vel_mask,
+        #         64,
+        #         os.path.join(savedir, "vel_{:03d}.png".format(i)),
+        #         scale=0.05,
+        #     )
 
         # for rgb_i in ["rgbh1", "rgbh2", "rgb0"]:
         #     if rgb_i in extras:
@@ -278,7 +278,7 @@ def render_path(
         #     imageio.imwrite(filename, other_rgb8)
 
         # if gt_imgs is not None:
-            # other_rgbs.append(gt_imgs[i])
+        # other_rgbs.append(gt_imgs[i])
         gt_img = torch.tensor(gt_imgs[i], dtype=torch.float32)  # [H, W, 3]
         lpips_value = lpips_net(rgb.permute(2, 0, 1), gt_img.permute(2, 0, 1), normalize=True).item()
         p = -10.0 * np.log10(np.mean(np.square(rgb.detach().cpu().numpy() - gt_img.cpu().numpy())))
@@ -288,9 +288,9 @@ def render_path(
         psnrs.append(p)
         ssims.append(ssim_value)
         # print(f"RENDER: PSNR: {p:.5g}, SSIM: {ssim_value:.5g}, LPIPS: {lpips_value:.5g}")
-        # filename = os.path.join(savedir, "gt_{:03d}.png".format(i))
-        # gt_img8 = to8b(gt_img.cpu().numpy())
-        # imageio.imwrite(filename, gt_img8)
+        imageio.imsave(os.path.join(savedir, "test_rgb_{:03d}.png".format(i)), rgb8)
+        gt8 = to8b(gt_img.cpu().numpy())
+        imageio.imsave(os.path.join(savedir, "test_gt_{:03d}.png".format(i)), gt8)
 
     # if gt_imgs is not None:
     avg_psnr = sum(psnrs) / len(psnrs)
@@ -419,8 +419,9 @@ def render_future_pred(
         # print(f"FUTURE: PSNR: {p:.5g}, SSIM: {ssim_value:.5g}, LPIPS: {lpips_value:.5g}")
 
         imageio.imsave(os.path.join(savedir, "fut_rgb_{:03d}.png".format(idx)), rgb8)
-        # gt8 = to8b(gt_img.cpu().numpy())
-        # imageio.imsave(os.path.join(savedir, "fut_gt_{:03d}.png".format(idx)), gt8)
+        gt8 = to8b(gt_img.cpu().numpy())
+        imageio.imsave(os.path.join(savedir, "fut_gt_{:03d}.png".format(idx)), gt8)
+        print("saved", os.path.join(savedir, "fut_rgb_{:03d}.png".format(idx)))
 
     if gt_imgs is not None:
         avg_psnr = sum(psnrs) / len(psnrs)
@@ -553,8 +554,8 @@ def render_advect_den(
 
         # print(f"ADVECT: PSNR: {p:.5g}, SSIM: {ssim_value:.5g}, LPIPS: {lpips_value:.5g}")
         imageio.imsave(os.path.join(savedir, "adv_rgb_{:03d}.png".format(i)), rgb8)
-        # gt8 = to8b(gt_img.detach().cpu().numpy())
-        # imageio.imsave(os.path.join(savedir, "adv_gt_{:03d}.png".format(i)), gt8)
+        gt8 = to8b(gt_img.detach().cpu().numpy())
+        imageio.imsave(os.path.join(savedir, "adv_gt_{:03d}.png".format(i)), gt8)
 
         # imageio.imsave(os.path.join(savedir, "rgb_{:03d}.png".format(i)), rgb8)
         # imageio.imsave(os.path.join(savedir, "gt_{:03d}.png".format(i)), gt_img.detach().cpu())
@@ -2710,7 +2711,7 @@ class SIREN_Hybrid(nn.Module):
         fading_fin_step: >0, to fade in layers one by one, fully faded in when self.fading_step >= fading_fin_step
         """
 
-        super(SIREN_Hybrid, self).__init__()
+        super().__init__()
         self.D = D
         self.W = W
         self.input_ch = input_ch
@@ -2793,9 +2794,8 @@ def get_rays(H, W, K, c2w):
     j = j.t()
     dirs = torch.stack([(i - K[0][2]) / K[0][0], -(j - K[1][2]) / K[1][1], -torch.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
-    rays_d = torch.sum(
-        dirs[..., np.newaxis, :] * c2w[:3, :3], -1
-    )  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    rays_d = torch.sum(dirs[..., None, :] * c2w[:3, :3], -1)
+    # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = c2w[:3, -1].expand(rays_d.shape)
     # import pdb

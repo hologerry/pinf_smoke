@@ -80,7 +80,7 @@ def pinf_train(parser, args):
             bkg_color,
             near,
             far,
-        ) = load_real_capture_frame_data(args.datadir, args.half_res, args.testskip)
+        ) = load_real_capture_frame_data(args.datadir, args.half_res)
 
     voxel_tran_inv = np.linalg.inv(voxel_tran)
     # print("Loaded pinf frame data", images.shape, render_poses.shape, hwfs[0], args.datadir)
@@ -148,49 +148,66 @@ def pinf_train(parser, args):
     render_timesteps = torch.Tensor(render_timesteps).cuda()
     test_bkg_color = np.float32([0.0, 0.0, 0.3])
 
+    # Move to GPU, except images
+    poses = torch.Tensor(poses).cuda()
+    time_steps = torch.Tensor(time_steps).cuda()
+
     # Short circuit if only rendering out from trained model
     if args.render_only:
         print("RENDER ONLY")
 
-        hwf = hwfs[0]
-        hwf = [int(hwf[0]) * 2, int(hwf[1]) * 2, float(hwf[2]) * 2]
-        K = Ks[0]
-
         with torch.no_grad():
-            if args.render_test:
-                # render_test switches to test poses
-                images = images[i_test]
-                hwf = hwfs[i_test[0]]
-                render_poses = poses[i_test]
-                render_poses = torch.Tensor(render_poses).cuda()
-                hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
-                K = Ks[i_test[0]]
-            else:
-                # Default is smoother render_poses path
-                images = None
 
-            testsavedir = os.path.join(
-                basedir, expname, "renderonly_{}_{:06d}".format("test" if args.render_test else "path", start + 1)
-            )
+            hwf = hwfs[0]
+            hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
+            # the path rendering can be very slow.
+
+            i_render = i_test
+            images_test = images[i_render]
+            render_poses_test = poses[i_render]
+            hwf = hwfs[i_render[0]]
+            hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
+            K = Ks[i_render[0]]
+            N_timesteps = images_test.shape[0]
+            test_timesteps = torch.arange(N_timesteps) / (N_timesteps - 1.0)
+            render_kwargs_test.update(network_query_fn_vel=vel_model)
+
+            # testsavedir = os.path.join(
+            #     basedir, expname, "renderonly_{}_{:06d}".format("test" if args.render_test else "path", start + 1)
+            # )
+            # os.makedirs(testsavedir, exist_ok=True)
+            # # print("test poses shape", render_poses.shape)
+            # render_kwargs_test["network_query_fn_vel"] = vel_model
+            # rgbs, _ = render_path(
+            #     render_poses,
+            #     hwf,
+            #     K,
+            #     args.chunk,
+            #     render_kwargs_test,
+            #     gt_imgs=images,
+            #     savedir=testsavedir,
+            #     render_factor=args.render_factor,
+            #     render_steps=render_timesteps,
+            #     bbox_model=bbox_model,
+            #     render_vel=True,
+            #     bkgd_color=test_bkg_color,
+            # )
+            # print("Done rendering", testsavedir)
+            # # imageio.mimwrite(os.path.join(testsavedir, "video.mp4"), to8b(rgbs), fps=30, quality=8)
+
+            testsavedir = os.path.join(basedir, expname, "renderonly_future_{:06d}".format(start + 1))
             os.makedirs(testsavedir, exist_ok=True)
-            # print("test poses shape", render_poses.shape)
-            render_kwargs_test["network_query_fn_vel"] = vel_model
-            rgbs, _ = render_path(
-                render_poses,
+
+            render_future_pred(
+                render_poses_test,
                 hwf,
                 K,
-                args.chunk,
-                render_kwargs_test,
-                gt_imgs=images,
-                savedir=testsavedir,
-                render_factor=args.render_factor,
-                render_steps=render_timesteps,
-                bbox_model=bbox_model,
-                render_vel=True,
-                bkgd_color=test_bkg_color,
+                test_timesteps,
+                testsavedir,
+                images_test,
+                bbox_model,
+                **render_kwargs_test,
             )
-            print("Done rendering", testsavedir)
-            # imageio.mimwrite(os.path.join(testsavedir, "video.mp4"), to8b(rgbs), fps=30, quality=8)
 
             return
 
@@ -242,6 +259,7 @@ def pinf_train(parser, args):
 
             return
 
+
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
@@ -252,10 +270,6 @@ def pinf_train(parser, args):
     # Prepare Loss Tools (VGG, Den2Vel)
     ###############################################
     vggTool = VGGlossTool()
-
-    # Move to GPU, except images
-    poses = torch.Tensor(poses).cuda()
-    time_steps = torch.Tensor(time_steps).cuda()
 
     N_iters = args.N_iter + 1
 
@@ -692,8 +706,6 @@ def pinf_train(parser, args):
                 hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
                 # the path rendering can be very slow.
 
-                testsavedir = os.path.join(basedir, expname, "run_advect_den_{:06d}".format(i))
-                os.makedirs(testsavedir, exist_ok=True)
 
                 i_render = i_test
                 images_test = images[i_render]
@@ -714,16 +726,20 @@ def pinf_train(parser, args):
                 #     bkgd_color=test_bkg_color,
                 #     render_vel=False,
                 # )
-                # render_advect_den(
-                #     render_poses_test,
-                #     hwf,
-                #     K,
-                #     test_timesteps,
-                #     testsavedir,
-                #     images_test,
-                #     bbox_model,
-                #     **render_kwargs_test,
-                # )
+
+                testsavedir = os.path.join(basedir, expname, "run_advect_den_{:06d}".format(i))
+                os.makedirs(testsavedir, exist_ok=True)
+
+                render_advect_den(
+                    render_poses_test,
+                    hwf,
+                    K,
+                    test_timesteps,
+                    testsavedir,
+                    images_test,
+                    bbox_model,
+                    **render_kwargs_test,
+                )
 
                 testsavedir = os.path.join(basedir, expname, "run_future_{:06d}".format(i))
                 os.makedirs(testsavedir, exist_ok=True)
@@ -796,6 +812,10 @@ def pinf_train(parser, args):
 
             if trainVel:
                 print("vel_loss: ", vel_loss.item())
+
+                split_nse_items = [nse.mean().item() for nse in split_nse]
+                print("NSE", split_nse_items)
+
 
                 # if nseloss_fine is not None:
                 #     print(" ".join(["nse(e1-e6):"] + [str(ei.item()) for ei in nse_errors]))
