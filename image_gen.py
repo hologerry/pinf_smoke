@@ -3,6 +3,8 @@ import os
 import imageio
 import numpy as np
 
+from tqdm import trange
+
 
 sim_path = "sim_000001"
 
@@ -35,8 +37,7 @@ def main():
     log_dirs = [os.path.join(curpath, "cam_{}".format(i)) for i in range(5)]
     for log_dir in log_dirs:
         os.makedirs(log_dir, exist_ok=True)
-    for frame_i in range(0, 151):
-        print(frame_i)
+    for frame_i in trange(0, 151):
         image_path = os.path.join(curpath, "imgsTarget_%06d.npz" % frame_i)
         for cam_id in range(5):
             image_k = np.load(image_path)["data"][img2cam[cam_id]] * y_scale

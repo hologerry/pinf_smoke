@@ -1,8 +1,8 @@
-expname = pinf_0_scalar
-basedir = ./logs
+expname = pinf_0_blue
+basedir = ./log
 
 ### data info
-datadir = ./data/ScalarReal/
+datadir = /data/Dynamics/RealCaptureBlackBlueCloudOneData
 dataset_type = pinf_data
 no_batching = True
 half_res = half

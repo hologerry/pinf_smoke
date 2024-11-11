@@ -1,462 +1,45 @@
-import datetime
 import os
-import pdb
-import shutil
 import sys
-import time
 
-import trimesh
+import imageio
+import numpy as np
+import torch
+import torch.nn.functional as F
 
-from lpips import LPIPS
+from tqdm import trange
 
-# vel_uv2hsv, den_scalar2rgb, jacobian3D, jacobian3D_np
-# vel_world2smoke, vel_smoke2world, pos_world2smoke, pos_smoke2world
-# Logger, VGGlossTool, ghost_loss_func
-from skimage import measure
-from skimage.metrics import structural_similarity
-
-from den2vel import DenToVel
+from density_to_velocity import DenToVel
+from helpers import (
+    BBox_Tool,
+    PDE_EQs,
+    SIREN_vel,
+    VGGlossTool,
+    Voxel_Tool,
+    batchify,
+    den_scalar2rgb,
+    fade_in_weight,
+    get_rays,
+    get_voxel_pts,
+    ghost_loss_func,
+    img2mse,
+    jacobian3D,
+    mean_squared_error,
+    model_fading_update,
+    mse2psnr,
+    off_smoke2world,
+    render_advect_den,
+    render_future_pred,
+    save_log,
+    set_rand_seed,
+    to8b,
+    vel_smoke2world,
+    vel_uv2hsv,
+    vel_world2smoke,
+)
 from load_pinf import load_pinf_frame_data
-from run_nerf import *
-from run_pinf_helpers import *
-
-
-def merge_imgs(save_dir, framerate=30, prefix=""):
-    os.system(
-        "ffmpeg -hide_banner -loglevel error -y -i {0}/{1}%03d.png -vf palettegen {0}/palette.png".format(
-            save_dir, prefix
-        )
-    )
-    os.system(
-        "ffmpeg -hide_banner -loglevel error -y -framerate {0} -i {1}/{2}%03d.png -i {1}/palette.png -lavfi paletteuse {1}/_{2}.gif".format(
-            framerate, save_dir, prefix
-        )
-    )
-    os.system(
-        "ffmpeg -hide_banner -loglevel error -y -framerate {0} -i {1}/{2}%03d.png -i {1}/palette.png -lavfi paletteuse -vcodec prores {1}/_{2}.mov".format(
-            framerate, save_dir, prefix
-        )
-    )
-
-
-def save_log(basedir, expname):
-    # logs
-    os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-    date_str = datetime.datetime.now().strftime("%m%d-%H%M%S")
-    filedir = "log_" + ("train" if not (args.vol_output_only or args.render_only) else "test")
-    filedir += date_str
-    log_dir = os.path.join(basedir, expname, filedir)
-    os.makedirs(log_dir, exist_ok=True)
-
-    sys.stdout = Logger(log_dir, False, fname="log.out")
-    sys.stderr = Logger(log_dir, False, fname="log.err")
-
-    print(" ".join(sys.argv), flush=True)
-    printENV()
-
-    # files backup
-    shutil.copyfile(args.config, os.path.join(basedir, expname, filedir, "config.txt"))
-    f = os.path.join(log_dir, "args.txt")
-    with open(f, "w") as file:
-        for arg in sorted(vars(args)):
-            attr = getattr(args, arg)
-            file.write("{} = {}\n".format(arg, attr))
-    filelist = ["run_nerf.py", "run_nerf_helpers.py", "run_pinf.py", "run_pinf_helpers.py"]
-    for filename in filelist:
-        shutil.copyfile("./" + filename, os.path.join(log_dir, filename.replace("/", "_")))
-
-    return filedir
-
-
-def model_fading_update(models, global_step, tempoDelay, velDelay, isHybrid):
-    tempoDelay = tempoDelay if isHybrid else 0
-    for _m in models:
-        if models[_m] is None:
-            continue
-        if _m == "vel_model":
-            models[_m].update_fading_step(global_step - tempoDelay - velDelay)
-        elif isHybrid:
-            models[_m].update_fading_step(global_step, global_step - tempoDelay)
-        else:
-            models[_m].update_fading_step(global_step)
-
-
-def batchify_query(inputs, query_function, batch_size=2**20):
-    """
-    args:
-        inputs: [..., input_dim]
-    return:
-        outputs: [..., output_dim]
-    """
-    input_dim = inputs.shape[-1]
-    input_shape = inputs.shape
-    inputs = inputs.view(-1, input_dim)  # flatten all but last dim
-    N = inputs.shape[0]
-    outputs = []
-    for i in range(0, N, batch_size):
-        output = query_function(inputs[i : i + batch_size])
-        if isinstance(output, tuple):
-            output = output[0].detach()
-        outputs.append(output)
-        del output
-    outputs = torch.cat(outputs, dim=0)
-    return outputs.view(*input_shape[:-1], -1).detach()  # unflatten
-
-
-def run_future_pred(
-    render_poses,
-    hwf,
-    K,
-    time_steps,
-    savedir,
-    gt_imgs,
-    bbox_model,
-    rx=128,
-    ry=192,
-    rz=128,
-    save_fields=False,
-    vort_particles=None,
-    project_solver=None,
-    get_vel_der_fn=None,
-    **render_kwargs,
-):
-    H, W, focal = hwf
-    dt = time_steps[1] - time_steps[0]
-    render_kwargs.update(chunk=512 * 16)
-    psnrs = []
-    lpipss = []
-    ssims = []
-    lpips_net = LPIPS().cuda()  # input should be [-1, 1] or [0, 1] (normalize=True)
-
-    # construct simulation domain grid
-    xs, ys, zs = torch.meshgrid([torch.linspace(0, 1, rx), torch.linspace(0, 1, ry), torch.linspace(0, 1, rz)])
-    coord_3d_sim = torch.stack([xs, ys, zs], dim=-1)  # [X, Y, Z, 3]
-    coord_3d_world = bbox_model.sim2world(coord_3d_sim)  # [X, Y, Z, 3]
-
-    # initialize density field
-    starting_frame = 89
-    n_pred = 30
-    time_step = torch.ones_like(coord_3d_world[..., :1]) * time_steps[starting_frame]
-    coord_4d_world = torch.cat([coord_3d_world, time_step], dim=-1)  # [X, Y, Z, 4]
-    den = batchify_query(
-        coord_4d_world, lambda pts: render_kwargs["network_query_fn"](pts, None, render_kwargs["network_fine"])
-    )  # [X, Y, Z, 1]
-    vel = batchify_query(coord_4d_world, render_kwargs["network_query_fn_vel"])  # [X, Y, Z, 3]
-
-    source_height = 0.25
-    y_start = int(source_height * ry)
-    print("y_start: {}".format(y_start))
-    # render_kwargs.update(y_start=y_start)
-    # proj_y = render_kwargs['proj_y']
-    for idx, i in enumerate(range(starting_frame + 1, starting_frame + n_pred + 1)):
-        c2w = render_poses[0]
-        mask_to_sim = coord_3d_sim[..., 1] > source_height
-        n_substeps = 1
-        use_reflect = False
-        render_kwargs["bbox_model"] = bbox_model
-        if vort_particles is not None:
-            confinement_field = vort_particles(coord_3d_sim, i)
-            print(
-                "Vortex energy over velocity: {:.2f}%".format(
-                    torch.norm(confinement_field, dim=-1).pow(2).sum() / torch.norm(vel, dim=-1).pow(2).sum() * 100
-                )
-            )
-        else:
-            confinement_field = torch.zeros_like(vel)
-        vel = vel + confinement_field
-
-        for _ in range(n_substeps):
-            dt_ = dt / n_substeps
-            den, _ = advect_SL(den, vel, coord_3d_sim, dt_, **render_kwargs)
-            if use_reflect:
-                vel_half_step, _ = advect_SL(vel, vel, coord_3d_sim, dt_ / 2, **render_kwargs)
-                vel_half_proj = vel_half_step.clone()
-                # vel_half_proj[..., 2] *= -1
-                # vel_half_proj[:, y_start:y_start + proj_y] = project_solver.Poisson(vel_half_proj[:, y_start:y_start + proj_y])
-                # vel_half_proj[..., 2] *= -1
-                vel_reflect = 2 * vel_half_proj - vel_half_step
-                vel, _ = advect_SL(vel_reflect, vel_half_proj, coord_3d_sim, dt_ / 2, **render_kwargs)
-                # vel[..., 2] *= -1
-                # vel[:, y_start:y_start + proj_y] = project_solver.Poisson(vel[:, y_start:y_start + proj_y])
-                # vel[..., 2] *= -1
-            else:
-                vel, _ = advect_SL(vel, vel, coord_3d_sim, dt_, **render_kwargs)
-                # vel[..., 2] *= -1  # world coord is left handed, while solver assumes right handed
-                # vel[:, y_start:y_start + proj_y] = project_solver.Poisson(vel[:, y_start:y_start + proj_y])
-                # vel[..., 2] *= -1
-
-        try:
-            coord_4d_world[..., 3] = time_steps[i]  # sample density source at current moment
-            den[~mask_to_sim] = batchify_query(
-                coord_4d_world[~mask_to_sim],
-                lambda pts: render_kwargs["network_query_fn"](pts, None, render_kwargs["network_fine"]),
-            )
-            vel[~mask_to_sim] = batchify_query(coord_4d_world[~mask_to_sim], render_kwargs["network_query_fn_vel"])
-        except IndexError:
-            pass
-
-        if save_fields:
-            save_fields_to_vti(  # type: ignore
-                vel.permute(2, 1, 0, 3).cpu().numpy(),
-                den.permute(2, 1, 0, 3).cpu().numpy(),
-                os.path.join(savedir, "fields_{:03d}.vti".format(idx)),
-            )
-            print("Saved fields to {}".format(os.path.join(savedir, "fields_{:03d}.vti".format(idx))))
-        rgb, _, _, _ = render(
-            H, W, K, c2w=c2w[:3, :4], time_step=time_steps[i][None], render_grid=True, den_grid=den, **render_kwargs
-        )
-        rgb = rgb[90:960, 45:540]  # HWC
-        rgb8 = to8b(rgb.cpu().numpy())
-        try:
-            gt_img = torch.tensor(gt_imgs[i].squeeze()[90:960, 45:540], dtype=torch.float32)  # [H, W, 3]
-            lpips_value = lpips_net(rgb.permute(2, 0, 1), gt_img.permute(2, 0, 1), normalize=True).item()
-            import pdb
-
-            # pdb.set_trace()
-            p = -10.0 * np.log10(np.mean(np.square(rgb.detach().cpu().numpy() - gt_img.cpu().numpy())))
-            ssim_value = structural_similarity(gt_img.cpu().numpy(), rgb.cpu().numpy(), data_range=1.0, channel_axis=2)
-            lpipss.append(lpips_value)
-            psnrs.append(p)
-            ssims.append(ssim_value)
-            print(f"PSNR: {p:.4g}, SSIM: {ssim_value:.4g}, LPIPS: {lpips_value:.4g}")
-        except IndexError:
-            pass
-        imageio.imsave(os.path.join(savedir, "rgb_{:03d}.png".format(idx)), rgb8)
-    merge_imgs(savedir, framerate=10, prefix="rgb_")
-
-    if gt_imgs is not None:
-        avg_psnr = sum(psnrs) / len(psnrs)
-        print(f"Avg PSNR over full simulation: ", avg_psnr)
-        avg_ssim = sum(ssims) / len(ssims)
-        print(f"Avg SSIM over full simulation: ", avg_ssim)
-        avg_lpips = sum(lpipss) / len(lpipss)
-        print(f"Avg LPIPS over full simulation: ", avg_lpips)
-        with open(
-            os.path.join(savedir, "psnrs_{:0.2f}_ssim_{:.2g}_lpips_{:.2g}.json".format(avg_psnr, avg_ssim, avg_lpips)),
-            "w",
-        ) as fp:
-            json.dump(psnrs, fp)
-
-
-def run_advect_den(
-    render_poses,
-    hwf,
-    K,
-    time_steps,
-    savedir,
-    gt_imgs,
-    bbox_model,
-    rx=128,
-    ry=192,
-    rz=128,
-    save_fields=False,
-    vort_particles=None,
-    get_vel_der_fn=None,
-    **render_kwargs,
-):
-    H, W, focal = hwf
-    dt = time_steps[1] - time_steps[0]
-    render_kwargs.update(chunk=512 * 32)
-    psnrs = []
-
-    # construct simulation domain grid
-    xs, ys, zs = torch.meshgrid([torch.linspace(0, 1, 80), torch.linspace(0, 1, 142), torch.linspace(0, 1, 80)])
-    coord_3d_sim = torch.stack([xs, ys, zs], dim=-1)  # [X, Y, Z, 3]
-    coord_3d_world = bbox_model.sim2world(coord_3d_sim)  # [X, Y, Z, 3]
-
-    xs_100, ys_178, zs_100 = torch.meshgrid(
-        [torch.linspace(0, 1, 100), torch.linspace(0, 1, 178), torch.linspace(0, 1, 100)]
-    )
-    coord_3d_sim_den = torch.stack([xs_100, ys_178, zs_100], dim=-1)  # [X, Y, Z, 3]
-    coord_3d_world_den = bbox_model.sim2world(coord_3d_sim_den)  # [X, Y, Z, 3]
-
-    # initialize density field
-    time_step = torch.ones_like(coord_3d_world[..., :1]) * time_steps[0]
-    coord_4d_world = torch.cat([coord_3d_world, time_step], dim=-1)  # [X, Y, Z, 4]
-    # pdb.set_trace()
-    den = batchify_query(
-        coord_4d_world, lambda pts: render_kwargs["network_query_fn"](pts, None, render_kwargs["network_fine"])
-    )  # [X, Y, Z, 1]
-    den[..., -1:] = F.relu(den[..., -1:])
-    vel = batchify_query(coord_4d_world, render_kwargs["network_query_fn_vel"])  # [X, Y, Z, 3]
-    # grid_savedir =
-
-    source_height = 0.25
-    for i, c2w in enumerate(tqdm(render_poses)):
-        gt_den = np.load("./data/ScalarReal/00000_syn_GT/_density/density_{:06}.npz".format(60 + i))["data"]
-        gt_vel = np.load("./data/ScalarReal/00000_syn_GT/_velocity/velocity_{:06}.npz".format(60 + i))["data"]
-        # positive_den = den[den[...,-1]>0]
-        # import pdb
-        # pdb.set_trace()
-        # positive_den_position = coord_3d_world_den[gt_den[...,-1]>0.1]
-        # positive_den_vel = gt_vel[gt_den[...,-1]>0.1]
-        # np.save(f"./gt_particles_scene_0/position_{i}", positive_den_position.cpu().numpy())
-        # np.save(f"./gt_particles_scene_0/velocity_{i}", positive_den_vel)
-        # print(i, positive_den_position.shape)
-        # v,f,n,val = measure.marching_cubes(den[...,-1].cpu().numpy(),0.9)
-        # mesh = trimesh.Trimesh(vertices = v, faces = f)
-        # import pdb
-        # pdb.set_trace()
-        # update simulation den and source den
-        mask_to_sim = coord_3d_sim[..., 1] > source_height
-        if i > 0:
-            coord_4d_world[..., 3] = time_steps[i - 1]  # sample velocity at previous moment
-
-            # coord_4d_world.requires_grad = True
-            vel = batchify_query(coord_4d_world, render_kwargs["network_query_fn_vel"])  # [X, Y, Z, 3]
-
-            vel_confined = vel
-            den, vel = advect_SL(den, vel_confined, coord_3d_sim, dt, RK=2, **render_kwargs)
-
-            # zero grad for coord_4d_world
-            # coord_4d_world.grad = None
-            # coord_4d_world = coord_4d_world.detach()
-
-            coord_4d_world[..., 3] = time_steps[i]  # source density at current moment
-            # pdb.set_trace()
-            # source_den = batchify_query(coord_4d_world, lambda pts: render_kwargs['network_query_fn'](pts, None, render_kwargs['network_fn']))
-            den[~mask_to_sim] = batchify_query(
-                coord_4d_world[~mask_to_sim],
-                lambda pts: render_kwargs["network_query_fn"](pts, None, render_kwargs["network_fine"]),
-            )
-        den_reconstruction = batchify_query(
-            coord_4d_world, lambda pts: render_kwargs["network_query_fn"](pts, None, render_kwargs["network_fine"])
-        )
-        vel_curr = batchify_query(coord_4d_world, render_kwargs["network_query_fn_vel"])
-        # print(confinement_field.shape)
-        np.save(os.path.join(savedir, f"density_advection_grid_{i}.npy"), den[..., -1].detach().cpu().numpy())
-        np.save(
-            os.path.join(savedir, f"density_reconstruction_grid_{i}.npy"),
-            den_reconstruction[..., -1].detach().cpu().numpy(),
-        )
-
-        np.save(os.path.join(savedir, f"velocity_grid_{i}.npy"), vel_curr[...].detach().cpu().numpy())
-        if save_fields:
-            save_fields_to_vti(  # type: ignore
-                vel.permute(2, 1, 0, 3).detach().cpu().numpy(),
-                den.permute(2, 1, 0, 3).detach().cpu().numpy(),
-                os.path.join(savedir, "fields_{:03d}.vti".format(i)),
-            )
-
-        render_kwargs["bbox_model"] = bbox_model
-        # pdb.set_trace()
-        rgb, _, _, _ = render(
-            H, W, K, c2w=c2w[:3, :4], time_step=time_steps[i][None], render_grid=True, den_grid=den, **render_kwargs
-        )
-        rgb8 = to8b(rgb.detach().cpu().numpy())
-        if gt_imgs is not None:
-            try:
-                gt_img = gt_imgs[i].detach().cpu().numpy()
-            except:
-                gt_img = gt_imgs[i]
-            p = -10.0 * np.log10(np.mean(np.square(rgb.detach().cpu().numpy() - gt_img)))
-            print(f"PSNR: {p:.4g}")
-            psnrs.append(p)
-        # pdb.set_trace()
-        imageio.imsave(os.path.join(savedir, "rgb_{:03d}.png".format(i)), rgb8)
-        # imageio.imsave(os.path.join(savedir, 'rgb_gt_{:03d}.png'.format(i)), gt_img.detach().cpu())
-    # merge_imgs(savedir, prefix='rgb_')
-
-    if gt_imgs is not None:
-        avg_psnr = sum(psnrs) / len(psnrs)
-        print(f"Avg PSNR over full simulation: ", avg_psnr)
-        with open(os.path.join(savedir, "source{}_psnrs_avg{:0.2f}.json".format(source_height, avg_psnr)), "w") as fp:
-            json.dump(psnrs, fp)
-        # pdb.set_trace()
-
-
-def advect_SL(
-    q_grid,
-    vel_world_prev,
-    coord_3d_sim,
-    dt,
-    RK=2,
-    y_start=48,
-    proj_y=128,
-    use_project=False,
-    project_solver=None,
-    bbox_model=None,
-    **kwargs,
-):
-    """Advect a scalar quantity using a given velocity field.
-    Args:
-        q_grid: [X', Y', Z', C]
-        vel_world_prev: [X, Y, Z, 3]
-        coord_3d_sim: [X, Y, Z, 3]
-        dt: float
-        RK: int, number of Runge-Kutta steps
-        y_start: where to start at y-axis
-        proj_y: simulation domain resolution at y-axis
-        use_project: whether to use Poisson solver
-        project_solver: Poisson solver
-        bbox_model: bounding box model
-    Returns:
-        advected_quantity: [X, Y, Z, 1]
-        vel_world: [X, Y, Z, 3]
-    """
-    # q_max, q_min = q_grid[...,-1].max(), q_grid[...,-1].min()
-    if RK == 1:
-        vel_world = vel_world_prev.clone()
-        vel_world[:, y_start : y_start + proj_y] = (
-            project_solver.Poisson(vel_world[:, y_start : y_start + proj_y])
-            if use_project
-            else vel_world[:, y_start : y_start + proj_y]
-        )
-        vel_sim = bbox_model.world2sim_rot(vel_world)  # [X, Y, Z, 3]
-    elif RK == 2:
-        vel_world = vel_world_prev.clone()  # [X, Y, Z, 3]
-        vel_world[:, y_start : y_start + proj_y] = (
-            project_solver.Poisson(vel_world[:, y_start : y_start + proj_y])
-            if use_project
-            else vel_world[:, y_start : y_start + proj_y]
-        )
-        # breakpoint()
-        vel_sim = bbox_model.world2sim_rot(vel_world)  # [X, Y, Z, 3]
-        coord_3d_sim_midpoint = coord_3d_sim - 0.5 * dt * vel_sim  # midpoint
-        midpoint_sampled = coord_3d_sim_midpoint * 2 - 1  # [X, Y, Z, 3]
-        vel_sim = (
-            F.grid_sample(
-                vel_sim.permute(3, 2, 1, 0)[None], midpoint_sampled.permute(2, 1, 0, 3)[None], align_corners=True
-            )
-            .squeeze(0)
-            .permute(3, 2, 1, 0)
-        )  # [X, Y, Z, 3]
-    else:
-        raise NotImplementedError
-    backtrace_coord = coord_3d_sim - dt * vel_sim  # [X, Y, Z, 3]
-    backtrace_coord_sampled = backtrace_coord * 2 - 1  # ranging [-1, 1]
-    q_grid = q_grid[None, ...].permute([0, 4, 3, 2, 1])  # [N, C, Z, Y, X] i.e., [N, C, D, H, W]
-    q_backtraced = F.grid_sample(
-        q_grid, backtrace_coord_sampled.permute(2, 1, 0, 3)[None, ...], align_corners=False
-    )  # [N, C, D, H, W]
-    q_backtraced = q_backtraced.squeeze(0).permute([3, 2, 1, 0])  # [X, Y, Z, C]
-    # q_backtraced[...,-1] = torch.clamp(q_backtraced[...,-1],q_min, q_max)
-    # q_backtraced[...,0] = torch.clamp(q_backtraced[...,0],q_grid[...,0].min(), q_grid[...,0].max())
-    # q_backtraced[...,1] = torch.clamp(q_backtraced[...,1],q_grid[...,1].min(), q_grid[...,1].max())
-    # q_backtraced[...,2] = torch.clamp(q_backtraced[...,2],q_grid[...,2].min(), q_grid[...,2].max())
-    return q_backtraced, vel_world
-
-
-def advect_maccormack(q_grid, vel_world_prev, coord_3d_sim, dt, **kwargs):
-    """
-    Args:
-        q_grid: [X', Y', Z', C]
-        vel_world_prev: [X, Y, Z, 3]
-        coord_3d_sim: [X, Y, Z, 3]
-        dt: float
-    Returns:
-        advected_quantity: [X, Y, Z, C]
-        vel_world: [X, Y, Z, 3]
-    """
-    q_max, q_min = q_grid[..., -1].max(), q_grid[..., -1].min()
-    q_grid_next, _ = advect_SL(q_grid, vel_world_prev, coord_3d_sim, dt, **kwargs)
-    q_grid_back, vel_world = advect_SL(q_grid_next, vel_world_prev, coord_3d_sim, -dt, **kwargs)
-    q_advected = q_grid_next + (q_grid - q_grid_back) / 2
-    q_advected[..., -1] = torch.clamp(q_advected[..., -1], q_min, q_max)
-    # q_advected[...,0] = torch.clamp(q_advected[...,0],q_grid[...,0].min(), q_grid[...,0].max())
-    # q_advected[...,1] = torch.clamp(q_advected[...,1],q_grid[...,1].min(), q_grid[...,1].max())
-    # q_advected[...,2] = torch.clamp(q_advected[...,2],q_grid[...,2].min(), q_grid[...,2].max())
-    return q_advected, vel_world
+from load_real import load_real_capture_frame_data
+from parser_helper import config_parser
+from run_nerf import create_nerf, render, render_path
 
 
 def pinf_train(parser, args):
@@ -466,32 +49,50 @@ def pinf_train(parser, args):
     logdir = save_log(basedir, expname)
 
     # Load data
-    (
-        images,
-        poses,
-        time_steps,
-        hwfs,
-        render_poses,
-        render_timesteps,
-        i_split,
-        t_info,
-        voxel_tran,
-        voxel_scale,
-        bkg_color,
-        near,
-        far,
-    ) = load_pinf_frame_data(args.datadir, args.half_res, args.testskip)
-    voxel_tran_inv = np.linalg.inv(voxel_tran)
-    print("Loaded pinf frame data", images.shape, render_poses.shape, hwfs[0], args.datadir)
-    print("Loaded voxel matrix", voxel_tran, "voxel scale", voxel_scale)
+    if "scalar" in args.datadir.lower():
+        (
+            images,
+            poses,
+            time_steps,
+            hwfs,
+            render_poses,
+            render_timesteps,
+            i_split,
+            t_info,
+            voxel_tran,
+            voxel_scale,
+            bkg_color,
+            near,
+            far,
+        ) = load_pinf_frame_data(args.datadir, args.half_res, args.testskip)
+    else:
+        (
+            images,
+            poses,
+            time_steps,
+            hwfs,
+            render_poses,
+            render_timesteps,
+            i_split,
+            t_info,
+            voxel_tran,
+            voxel_scale,
+            bkg_color,
+            near,
+            far,
+        ) = load_real_capture_frame_data(args.datadir, args.half_res, args.testskip)
 
-    voxel_tran_inv = torch.Tensor(voxel_tran_inv)
-    voxel_tran = torch.Tensor(voxel_tran)
-    voxel_scale = torch.Tensor(voxel_scale)
+    voxel_tran_inv = np.linalg.inv(voxel_tran)
+    # print("Loaded pinf frame data", images.shape, render_poses.shape, hwfs[0], args.datadir)
+    # print("Loaded voxel matrix", voxel_tran, "voxel scale", voxel_scale)
+
+    voxel_tran_inv = torch.Tensor(voxel_tran_inv).cuda()
+    voxel_tran = torch.Tensor(voxel_tran).cuda()
+    voxel_scale = torch.Tensor(voxel_scale).cuda()
 
     i_train, i_val, i_test = i_split
-    args.white_bkgd = torch.Tensor(bkg_color).to(device)
-    print("Scene has background color", bkg_color, args.white_bkgd)
+    args.white_bkgd = torch.Tensor(bkg_color).cuda()
+    # print("Scene has background color", bkg_color, args.white_bkgd)
 
     Ks = [[[hwf[-1], 0, 0.5 * hwf[1]], [0, hwf[-1], 0.5 * hwf[0]], [0, 0, 1]] for hwf in hwfs]
 
@@ -512,7 +113,7 @@ def pinf_train(parser, args):
 
     if args.nseW > 1e-8:
         # D=6, W=128, input_ch=4, output_ch=3, skips=[],
-        vel_model = SIREN_vel(fading_fin_step=args.fading_layers, bbox_model=bbox_model).to(device)
+        vel_model = SIREN_vel(fading_fin_step=args.fading_layers, bbox_model=bbox_model).cuda()
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, vel_optimizer = create_nerf(
@@ -520,11 +121,7 @@ def pinf_train(parser, args):
     )
     global_step = start
 
-    update_dict = {
-        "near": near,
-        "far": far,
-        "has_t": True,
-    }
+    update_dict = {"near": near, "far": far, "has_t": True}
     render_kwargs_train.update(update_dict)
     render_kwargs_test.update(update_dict)
     render_kwargs_train["vel_model"] = vel_model
@@ -547,16 +144,14 @@ def pinf_train(parser, args):
         model_fading_update(all_models, start, tempoInStep, velInStep, args.net_model == "hybrid")
 
     # Move testing data to GPU
-    render_poses = torch.Tensor(render_poses).to(device)
-    render_timesteps = torch.Tensor(render_timesteps).to(device)
+    render_poses = torch.Tensor(render_poses).cuda()
+    render_timesteps = torch.Tensor(render_timesteps).cuda()
     test_bkg_color = np.float32([0.0, 0.0, 0.3])
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
         print("RENDER ONLY")
-        import pdb
 
-        # pdb.set_trace()
         hwf = hwfs[0]
         hwf = [int(hwf[0]) * 2, int(hwf[1]) * 2, float(hwf[2]) * 2]
         K = Ks[0]
@@ -567,7 +162,7 @@ def pinf_train(parser, args):
                 images = images[i_test]
                 hwf = hwfs[i_test[0]]
                 render_poses = poses[i_test]
-                render_poses = torch.Tensor(render_poses).to(device)
+                render_poses = torch.Tensor(render_poses).cuda()
                 hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
                 K = Ks[i_test[0]]
             else:
@@ -578,8 +173,7 @@ def pinf_train(parser, args):
                 basedir, expname, "renderonly_{}_{:06d}".format("test" if args.render_test else "path", start + 1)
             )
             os.makedirs(testsavedir, exist_ok=True)
-            print("test poses shape", render_poses.shape)
-            # pdb.set_trace()
+            # print("test poses shape", render_poses.shape)
             render_kwargs_test["network_query_fn_vel"] = vel_model
             rgbs, _ = render_path(
                 render_poses,
@@ -596,7 +190,7 @@ def pinf_train(parser, args):
                 bkgd_color=test_bkg_color,
             )
             print("Done rendering", testsavedir)
-            imageio.mimwrite(os.path.join(testsavedir, "video.mp4"), to8b(rgbs), fps=30, quality=8)
+            # imageio.mimwrite(os.path.join(testsavedir, "video.mp4"), to8b(rgbs), fps=30, quality=8)
 
             return
 
@@ -618,7 +212,7 @@ def pinf_train(parser, args):
             frame_N = len(t_list)
             noStatic = False
             for frame_i in range(frame_N // 10, frame_N, 10):
-                print(frame_i, frame_N)
+                # print(frame_i, frame_N)
                 cur_t = t_list[frame_i]
                 voxel_writer.save_voxel_den_npz(
                     os.path.join(testsavedir, "d_%04d.npz" % frame_i),
@@ -644,7 +238,7 @@ def pinf_train(parser, args):
                         savejpg,
                         save_vort,
                     )
-            print("Done output", testsavedir)
+            # print("Done output", testsavedir)
 
             return
 
@@ -657,18 +251,18 @@ def pinf_train(parser, args):
 
     # Prepare Loss Tools (VGG, Den2Vel)
     ###############################################
-    vggTool = VGGlossTool(device)
+    vggTool = VGGlossTool()
 
     # Move to GPU, except images
-    poses = torch.Tensor(poses).to(device)
-    time_steps = torch.Tensor(time_steps).to(device)
+    poses = torch.Tensor(poses).cuda()
+    time_steps = torch.Tensor(time_steps).cuda()
 
     N_iters = args.N_iter + 1
 
-    print("Begin")
-    print("TRAIN views are", i_train)
-    print("TEST views are", i_test)
-    print("VAL views are", i_val)
+    # print("Begin")
+    # print("TRAIN views are", i_train)
+    # print("TEST views are", i_test)
+    # print("VAL views are", i_val)
 
     # Prepare Voxel Sampling Tools for Image Summary (voxel_writer), Physical Priors (training_voxel), Data Priors Represented by D2V (den_p_all)
     # voxel_writer: to sample low resolution data for for image summary
@@ -711,10 +305,8 @@ def pinf_train(parser, args):
     ghost_loss, overlay_loss, nseloss_fine, d2v_error = None, None, None, None
 
     d2v_model = DenToVel() if args.d2vW > 1e-8 else None
-    for i in trange(start, N_iters):
-        import pdb
+    for i in trange(start, N_iters, desc="Training"):
 
-        # pdb.set_trace()
         # time0 = time.time()
         if args.net_model != "nerf":
             model_fading_update(all_models, global_step, tempoInStep, velInStep, args.net_model == "hybrid")
@@ -740,9 +332,9 @@ def pinf_train(parser, args):
         # Random from one frame
         img_i = np.random.choice(i_train)
         target = images[img_i]
-        target = torch.Tensor(target).to(device)
+        target = torch.Tensor(target).cuda()
         pose = poses[img_i, :3, :4]
-        time_locate = torch.Tensor(time_steps[img_i]).to(device)
+        time_locate = torch.Tensor(time_steps[img_i]).cuda()
 
         # Cast intrinsics to right types
         H, W, focal = hwfs[img_i]
@@ -920,10 +512,10 @@ def pinf_train(parser, args):
                         ),
                         -1,
                     )
-                    if i == start:
-                        print(
-                            f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}"
-                        )
+                    # if i == start:
+                    #     print(
+                    #         f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}"
+                    #     )
                 else:
                     coords = torch.stack(
                         torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)), -1
@@ -1075,73 +667,14 @@ def pinf_train(parser, args):
             torch.save(save_dic, path)
             print("Saved checkpoints at", path)
 
-        if i % args.i_video == 0 and i > 0:
-            # Turn on testing mode
-
-            with torch.no_grad():
-                hwf = hwfs[0]
-                hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
-                # the path rendering can be very slow.
-
-                testsavedir = os.path.join(basedir, expname, "run_advect_den_{:06d}".format(start))
-                os.makedirs(testsavedir, exist_ok=True)
-
-                i_render = i_test
-                images_test = images[i_render]
-                render_poses_test = poses[i_render]
-                hwf = hwfs[i_render[0]]
-                hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
-                K = Ks[i_render[0]]
-                N_timesteps = images_test.shape[0]
-                test_timesteps = torch.arange(N_timesteps) / (N_timesteps - 1.0)
-                render_kwargs_test.update(network_query_fn_vel=vel_model)
-                # rgbs, disps = render_path(render_poses_test, hwf, K, args.chunk, render_kwargs_test, render_steps=render_timesteps, bkgd_color=test_bkg_color,render_vel=False)
-                run_advect_den(
-                    render_poses_test,
-                    hwf,
-                    K,
-                    test_timesteps,
-                    testsavedir,
-                    images_test,
-                    bbox_model,
-                    **render_kwargs_test,
-                )
-                # import pdb
-                # pdb.set_trace()
-            # print('Done, saving', rgbs.shape, disps.shape)
-            # moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            # imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-            # imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
-
-            v_deltaT = 0.025
-            with torch.no_grad():
-                vel_rgbs = []
-                for _t in range(int(1.0 / v_deltaT)):
-                    # pdb.set_trace()
-                    # middle_slice, True: only sample middle slices for visualization, very fast, but cannot save as npz
-                    #               False: sample whole volume, can be saved as npz, but very slow
-                    voxel_vel = training_voxel.get_voxel_velocity(
-                        t_info[-1], _t * v_deltaT, batchify, args.chunk, vel_model, middle_slice=True
-                    )
-                    voxel_vel = voxel_vel.view([-1] + list(voxel_vel.shape))
-                    _, voxel_vort = jacobian3D(voxel_vel)
-                    _vel = vel_uv2hsv(np.squeeze(voxel_vel.detach().cpu().numpy()), scale=300, is3D=True, logv=False)
-                    _vort = vel_uv2hsv(
-                        np.squeeze(voxel_vort.detach().cpu().numpy()), scale=1500, is3D=True, logv=False
-                    )
-                    vel_rgbs.append(np.concatenate([_vel, _vort], axis=0))
-            moviebase = os.path.join(basedir, expname, "{}_volume_{:06d}_".format(expname, i))
-            imageio.mimwrite(moviebase + "velrgb.mp4", np.stack(vel_rgbs, axis=0).astype(np.uint8), fps=30, quality=8)
-
         if i % args.i_testset == 0 and i > 0:
             testsavedir = os.path.join(basedir, expname, "testset_{:06d}".format(i))
             os.makedirs(testsavedir, exist_ok=True)
-            print("test poses shape", poses[i_test].shape)
             with torch.no_grad():
                 hwf = hwfs[i_test[0]]
                 hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
                 render_path(
-                    torch.Tensor(poses[i_test]).to(device),
+                    torch.Tensor(poses[i_test]).cuda(),
                     hwf,
                     Ks[i_test[0]],
                     args.chunk,
@@ -1153,66 +686,143 @@ def pinf_train(parser, args):
                 )
             print("Saved test set")
 
+        if i % args.i_video == 0 and i > 0:
+            with torch.no_grad():
+                hwf = hwfs[0]
+                hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
+                # the path rendering can be very slow.
+
+                testsavedir = os.path.join(basedir, expname, "run_advect_den_{:06d}".format(i))
+                os.makedirs(testsavedir, exist_ok=True)
+
+                i_render = i_test
+                images_test = images[i_render]
+                render_poses_test = poses[i_render]
+                hwf = hwfs[i_render[0]]
+                hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
+                K = Ks[i_render[0]]
+                N_timesteps = images_test.shape[0]
+                test_timesteps = torch.arange(N_timesteps) / (N_timesteps - 1.0)
+                render_kwargs_test.update(network_query_fn_vel=vel_model)
+                # rgbs, disps = render_path(
+                #     render_poses_test,
+                #     hwf,
+                #     K,
+                #     args.chunk,
+                #     render_kwargs_test,
+                #     render_steps=render_timesteps,
+                #     bkgd_color=test_bkg_color,
+                #     render_vel=False,
+                # )
+                # render_advect_den(
+                #     render_poses_test,
+                #     hwf,
+                #     K,
+                #     test_timesteps,
+                #     testsavedir,
+                #     images_test,
+                #     bbox_model,
+                #     **render_kwargs_test,
+                # )
+
+                testsavedir = os.path.join(basedir, expname, "run_future_{:06d}".format(i))
+                os.makedirs(testsavedir, exist_ok=True)
+
+                render_future_pred(
+                    render_poses_test,
+                    hwf,
+                    K,
+                    test_timesteps,
+                    testsavedir,
+                    images_test,
+                    bbox_model,
+                    **render_kwargs_test,
+                )
+
+                # print('Done, saving', rgbs.shape, disps.shape)
+            # moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
+            # imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+            # imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+
+            # v_deltaT = 0.025
+            # with torch.no_grad():
+            #     vel_rgbs = []
+            #     for _t in range(int(1.0 / v_deltaT)):
+            #         # middle_slice, True: only sample middle slices for visualization, very fast, but cannot save as npz
+            #         #               False: sample whole volume, can be saved as npz, but very slow
+            #         voxel_vel = training_voxel.get_voxel_velocity(
+            #             t_info[-1], _t * v_deltaT, batchify, args.chunk, vel_model, middle_slice=True
+            #         )
+            #         voxel_vel = voxel_vel.view([-1] + list(voxel_vel.shape))
+            #         _, voxel_vort = jacobian3D(voxel_vel)
+            #         _vel = vel_uv2hsv(np.squeeze(voxel_vel.detach().cpu().numpy()), scale=300, is3D=True, logv=False)
+            #         _vort = vel_uv2hsv(
+            #             np.squeeze(voxel_vort.detach().cpu().numpy()), scale=1500, is3D=True, logv=False
+            #         )
+            #         vel_rgbs.append(np.concatenate([_vel, _vort], axis=0))
+            # moviebase = os.path.join(basedir, expname, "{}_volume_{:06d}_".format(expname, i))
+            # imageio.mimwrite(moviebase + "velrgb.mp4", np.stack(vel_rgbs, axis=0).astype(np.uint8), fps=30, quality=8)
+
         if i % args.i_print == 0:
             print(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-            if trainImg:
-                if args.N_importance > 0:
-                    print("img_loss: ", img_loss.item(), img_loss0.item())
-                else:
-                    print("img_loss: ", img_loss.item())
+            # if trainImg:
+            #     if args.N_importance > 0:
+            #         print("img_loss: ", img_loss.item(), img_loss0.item())
+            #     else:
+            #         print("img_loss: ", img_loss.item())
 
-                if trainVGG:
-                    print("vgg_loss: %0.4f *" % w_vgg, vgg_loss_sum.item())
-                    for vgg_i in range(len(vgg_loss)):
-                        _wf = vgg_fading[vgg_i]
-                        if args.N_importance > 0:
-                            print(
-                                vggTool.layer_names[vgg_i],
-                                vgg_loss[vgg_i].item(),
-                                "+",
-                                vgg_loss0[vgg_i].item(),
-                                "with vgg_fading: %0.4f" % _wf,
-                            )
-                        else:
-                            print(vggTool.layer_names[vgg_i], vgg_loss[vgg_i].item(), "with vgg_fading: %0.4f" % _wf)
+            #     if trainVGG:
+            #         print("vgg_loss: %0.4f *" % w_vgg, vgg_loss_sum.item())
+            #         # for vgg_i in range(len(vgg_loss)):
+            #         #     _wf = vgg_fading[vgg_i]
+            #         #     if args.N_importance > 0:
+            #         #         print(
+            #         #             vggTool.layer_names[vgg_i],
+            #         #             vgg_loss[vgg_i].item(),
+            #         #             "+",
+            #         #             vgg_loss0[vgg_i].item(),
+            #         #             "with vgg_fading: %0.4f" % _wf,
+            #         #         )
+            #         #     else:
+            #         #         print(vggTool.layer_names[vgg_i], vgg_loss[vgg_i].item(), "with vgg_fading: %0.4f" % _wf)
 
-                if ghost_loss is not None:
-                    _g = ghost_loss.item()
-                    _cg = ghost_loss0.item() if args.N_importance > 0 else 0
-                    print("w_ghost: %0.4f," % w_ghost, "ghost_loss: ", _g, "coarse: ", _cg, "fine: ", _g - _cg)
+            #     if ghost_loss is not None:
+            #         _g = ghost_loss.item()
+            #         _cg = ghost_loss0.item() if args.N_importance > 0 else 0
+            #         print("w_ghost: %0.4f," % w_ghost, "ghost_loss: ", _g, "coarse: ", _cg, "fine: ", _g - _cg)
 
-                if overlay_loss is not None:
-                    print("w_overlay: %0.4f," % w_overlay, "overlay_loss: ", overlay_loss.item())
+            #     if overlay_loss is not None:
+            #         print("w_overlay: %0.4f," % w_overlay, "overlay_loss: ", overlay_loss.item())
 
             if trainVel:
                 print("vel_loss: ", vel_loss.item())
 
-                if nseloss_fine is not None:
-                    print(" ".join(["nse(e1-e6):"] + [str(ei.item()) for ei in nse_errors]))
-                    print(
-                        "NSE loss sum = ",
-                        nseloss_fine.item(),
-                        "* w_nse(%0.4f) * vel_fading(%0.4f)" % (args.nseW, vel_fading),
-                    )
+                # if nseloss_fine is not None:
+                #     print(" ".join(["nse(e1-e6):"] + [str(ei.item()) for ei in nse_errors]))
+                #     print(
+                #         "NSE loss sum = ",
+                #         nseloss_fine.item(),
+                #         "* w_nse(%0.4f) * vel_fading(%0.4f)" % (args.nseW, vel_fading),
+                #     )
 
-                if d2v_error is not None:
-                    print(
-                        "d2v_error, ", d2v_error.item(), "* w_d2v(%0.4f) * d2v_fading(%0.4f)" % (args.d2vW, d2v_fading)
-                    )
-                    print(
-                        "d2v_scale_factor",
-                        scale_factor.item(),
-                        "d2v_jac_scale",
-                        d2v_jac_scale.item(),
-                        "cur_jac_scale",
-                        cur_jac_scale.item(),
-                    )
+                # if d2v_error is not None:
+                #     print(
+                #         "d2v_error, ", d2v_error.item(), "* w_d2v(%0.4f) * d2v_fading(%0.4f)" % (args.d2vW, d2v_fading)
+                #     )
+                #     print(
+                #         "d2v_scale_factor",
+                #         scale_factor.item(),
+                #         "d2v_jac_scale",
+                #         d2v_jac_scale.item(),
+                #         "cur_jac_scale",
+                #         cur_jac_scale.item(),
+                #     )
 
-            if args.net_model != "nerf":
-                for _m in all_models:
-                    if all_models[_m] is None:
-                        continue
-                    all_models[_m].print_fading()
+            # if args.net_model != "nerf":
+            #     for _m in all_models:
+            #         if all_models[_m] is None:
+            #             continue
+            #         all_models[_m].print_fading()
 
             # mem_t = torch.cuda.get_device_properties(0).total_memory
             # mem_r = torch.cuda.memory_reserved(0)
@@ -1320,9 +930,11 @@ if __name__ == "__main__":
     set_rand_seed(args.fix_seed)
 
     bkg_flag = args.white_bkgd
-    args.white_bkgd = np.ones([3], dtype=np.float32) if bkg_flag else None
+    args.white_bkgd = None  # np.ones([3], dtype=np.float32) if bkg_flag else None
 
-    if args.dataset_type == "pinf_data":
-        pinf_train(parser, args)
-    else:
-        train(parser, args)  # call train in run_nerf
+    pinf_train(parser, args)
+    # if args.dataset_type == "pinf_data":
+    #     pinf_train(parser, args)
+    # else:
+    #     train(parser, args)  # call train in run_nerf
+    #     train(parser, args)  # call train in run_nerf

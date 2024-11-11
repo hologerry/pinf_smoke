@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from run_pinf_helpers import curl2D, curl3D
+from helpers import curl2D, curl3D
 
 
 """ Import pre-trained D2V model as a fixed PyTorch Model
