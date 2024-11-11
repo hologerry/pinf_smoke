@@ -5,7 +5,7 @@ import imageio
 import json
 import torch.nn.functional as F
 import cv2
-
+import pdb
 trans_t = lambda t : torch.Tensor([
     [1,0,0,0],
     [0,1,0,0],
@@ -79,6 +79,7 @@ def load_pinf_frame_data(basedir, half_res='normal', testskip=1):
         # read video frames
         # all videos should be synchronized, having the same frame_rate and frame_num
         for s in 'train,val,test'.split(','):
+            # pdb.set_trace()
             if s=='train' or testskip==0:
                 skip = 1
             else:
@@ -91,15 +92,20 @@ def load_pinf_frame_data(basedir, half_res='normal', testskip=1):
                 poses = []
                 time_steps = []
                 H, W, Focal = 0, 0, 0
-
+                
                 f_name = os.path.join(basedir, train_video['file_name'])
+                
                 reader = imageio.get_reader(f_name, "ffmpeg")
-                if s=='train':
-                    delta_t = 1.0/train_video['frame_num']
+                # if s=='train':
+                delta_t = 1.0/train_video['frame_num']
+                
                 for frame_i in range(0, train_video['frame_num'], skip):
-                    reader.set_image_index(frame_i)
-                    frame = reader.get_next_data()
-
+                    try:
+                        reader.set_image_index(frame_i)
+                        frame = reader.get_next_data()
+                    except:
+                        pdb.set_trace()
+                    
                     if H == 0:
                         H, W = frame.shape[:2]
                         camera_angle_x = float(train_video['camera_angle_x'])

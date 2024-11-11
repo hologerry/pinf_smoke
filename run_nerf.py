@@ -63,12 +63,14 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, chunk=1024*32, render_vel=False,**kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk],render_vel=render_vel, **kwargs)
+        # import pdb
+        # pdb.set_trace()
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -81,7 +83,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
-                  time_step=None, bkgd_color=None,
+                  time_step=None, bkgd_color=None,render_vel=False,
                   **kwargs):
     """Render rays
     Args:
@@ -140,7 +142,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         # (ray origin, ray direction, min dist, max dist, normalized viewing direction, t)
         rays = torch.cat([rays, time_step], dim=-1)
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, render_vel=render_vel,**kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -152,14 +154,18 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
             rgb_i, acc_i = 'rgb'+_i, 'acc'+_i
             if (rgb_i in all_ret) and (acc_i in all_ret):
                 all_ret[rgb_i] = all_ret[rgb_i] + torch_bkgd_color*(1.-all_ret[acc_i][..., None])
-
+    # if render_vel:
+    #     import pdb
+    #     pdb.set_trace()
     k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    if 'vel_map' in all_ret:
+        k_extract+=['vel_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0, render_steps=None, bkgd_color=None):
+def render_path(render_poses, hwf, K, chunk, render_kwargs,bbox_model=None, gt_imgs=None, savedir=None, render_factor=0, render_steps=None, bkgd_color=None, render_vel=False):
 
     H, W, focal = hwf
 
@@ -171,15 +177,23 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     rgbs = []
     disps = []
-
+    vels=[]
     t = time.time()
     cur_timestep = None
-    for i, c2w in enumerate(tqdm(render_poses)):
+    start=119
+    for i, c2w in enumerate(tqdm(render_poses[start:])):
+        i = i+start
         print(i, time.time() - t)
         if render_steps is not None:
             cur_timestep = render_steps[i]
         t = time.time()
-        rgb, disp, acc, extras = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], time_step=cur_timestep, bkgd_color=bkgd_color, **render_kwargs)
+        if render_vel:
+            rgb, disp, acc, vel_map, extras = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4],bbox_model=bbox_model, time_step=cur_timestep,render_vel=render_vel, **render_kwargs)
+        else:
+            rgb, disp, acc, extras = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4],bbox_model=bbox_model, time_step=cur_timestep,render_vel=render_vel, **render_kwargs)
+        import pdb
+        # pdb.set_trace()
+        # vels.append(vel_map.cpu().numpy())
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         if i==0:
@@ -195,7 +209,12 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
-
+            # pdb.set_trace()
+            vel_mask=(rgbs[-1]>0.1).any(-1)
+            vel_map[450:]=0
+            if render_vel:
+                save_quiver_plot(vel_map[..., 0].cpu().numpy()*vel_mask, vel_map[..., 1].cpu().numpy()*vel_mask, 64, os.path.join(savedir, 'vel_{:03d}.png'.format(i)),
+                             scale=0.05)
             other_rgbs = []
             if gt_imgs is not None:
                 other_rgbs.append(gt_imgs[i])
@@ -340,7 +359,7 @@ def create_nerf(args, vel_model=None, bbox_model=None, ndim=3):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, vel_optimizer
 
 
-def raw2outputs(raw_list, z_vals, rays_d, raw_noise_std=0, pytest=False, remove99=False):
+def raw2outputs(raw_list, z_vals, rays_d, raw_noise_std=0, pytest=False, remove99=False, render_vel=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw_list: a list of tensors in shape [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -377,8 +396,11 @@ def raw2outputs(raw_list, z_vals, rays_d, raw_noise_std=0, pytest=False, remove9
         alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
         if remove99:
             alpha = torch.where(alpha > 0.99, torch.zeros_like(alpha), alpha)
-        rgb = torch.sigmoid(raw[..., :3]) # [N_rays, N_samples, 3]
-
+        if render_vel:
+            rgb = raw[..., :3]
+        else:
+            rgb = torch.sigmoid(raw[..., :3]) # [N_rays, N_samples, 3]
+        
         alpha_list += [alpha]
         color_list += [rgb]
     
@@ -413,8 +435,13 @@ def raw2outputs(raw_list, z_vals, rays_d, raw_noise_std=0, pytest=False, remove9
         content_sum = torch.sum(content_map, dim=-1) 
         # [N_rays, (N_contentlist,)]
         return content_sum, content_map
-
-    rgb_map, _ = weighted_sum_of_samples(weights_list, color_list) # [N_rays, 3]
+    if not render_vel:
+        rgb_map, _ = weighted_sum_of_samples(weights_list, color_list) # [N_rays, 3]
+    else:
+        mask=color_list[0][...,-1]>0.1
+        rgb_map = color_list[0][:, int(color_list[0].shape[1]/3.5), :3]#*mask[:, int(color_list[0].shape[1]/3.5), None]
+        # import pdb
+        # pdb.set_trace()
     # Sum of weights along each ray. This value is in [0, 1] up to numerical error.
     acc_map, _ = weighted_sum_of_samples(weights_list, None, 1) # [N_rays]
 
@@ -435,6 +462,35 @@ def raw2outputs(raw_list, z_vals, rays_d, raw_noise_std=0, pytest=False, remove9
 
     return rgb_map, disp_map, acc_map, weights, depth_map, Ti_all[...,-1], rgb_map_stack, acc_map_stack
 
+def save_quiver_plot(u, v, res, save_path, scale=0.00000002):
+    """
+    Args:
+        u: [H, W], vel along x (W)
+        v: [H, W], vel along y (H)
+        res: resolution of the plot along the longest axis; if None, let step = 1
+        save_path:
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib
+    H, W = u.shape
+    y, x = np.mgrid[0:H, 0:W]
+    axis_len = max(H, W)
+    step = 1 if res is None else axis_len // res
+    xq = [i[::step] for i in x[::step]]
+    yq = [i[::step] for i in y[::step]]
+    uq = [i[::step] for i in u[::step]]
+    vq = [i[::step] for i in v[::step]]
+
+    uv_norm = np.sqrt(np.array(uq) ** 2 + np.array(vq) ** 2).max()
+    short_len = min(H, W)
+    matplotlib.rcParams['font.size'] = 10 / short_len * axis_len
+    fig, ax = plt.subplots(figsize=(10 / short_len * W, 10 / short_len * H))
+    q = ax.quiver(xq, yq, uq, vq, pivot='tail', angles='uv', scale_units='xy', scale=scale / step)
+    ax.invert_yaxis()
+    plt.quiverkey(q, X=0.6, Y=1.05, U=uv_norm, label=f'Max arrow length = {uv_norm:.2g}', labelpos='E')
+    plt.savefig(save_path)
+    plt.close()
+    return
 
 def render_rays(ray_batch,
                 network_fn,
@@ -448,11 +504,16 @@ def render_rays(ray_batch,
                 raw_noise_std=0.,
                 verbose=False,
                 pytest=False,
+                render_vel=True,
                 has_t = False,
                 vel_model=None,
                 netchunk=1024*64,
                 warp_fading_dt=None,
+                network_query_fn_vel=None,
                 warp_mod="rand",
+                render_grid=False,
+                den_grid=None,
+                bbox_model=None,
                 remove99=False):
     """Volumetric rendering.
     Args:
@@ -485,6 +546,123 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
+    
+    if render_grid:
+        N_rays = ray_batch.shape[0]
+        rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+        time_step = ray_batch[0, -1]
+        bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
+        near, far = bounds[...,0], bounds[...,1] # [-1,1]
+
+        t_vals = torch.linspace(0., 1., steps=N_samples)
+        z_vals = near * (1.-t_vals) + far * (t_vals)
+
+        z_vals = z_vals.expand([N_rays, N_samples])
+        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+        pts = torch.cat([pts, time_step * torch.ones((pts.shape[0], pts.shape[1], 1))], -1)  # [..., 4]
+        pts_flat = torch.reshape(pts, [-1, 4])
+        
+        # import pdb
+        # pdb.set_trace()
+        bbox_mask = bbox_model.insideMask(pts_flat[..., :3], to_float=False)
+        if bbox_mask.sum() == 0:
+            bbox_mask[0] = True  # in case zero rays are inside the bbox
+        # bbox_mask = torch.ones_like(bbox_mask)
+        pts = pts_flat[bbox_mask]
+
+        ret = {}
+        out_dim = 4
+        raw_flat_den = torch.zeros([N_rays, N_samples, out_dim]).reshape(-1, out_dim)
+
+        pts_world = pts[..., :3]
+        pts_sim = bbox_model.world2sim(pts_world)
+        pts_sample = pts_sim * 2 - 1  # ranging [-1, 1]
+        import pdb
+        # pdb.set_trace()
+        den_grid = den_grid
+        den_grid_d = den_grid[...,[3]][None, ...].permute([0, 4, 3, 2, 1])
+#         den_grid_r = den_grid[...,[0]][None, ...].permute([0, 4, 3, 2, 1])
+#         den_grid_g = den_grid[...,[1]][None, ...].permute([0, 4, 3, 2, 1])
+#         den_grid_b = den_grid[...,[2]][None, ...].permute([0, 4, 3, 2, 1])
+        
+        den_sampled = F.grid_sample(den_grid_d, pts_sample[None, ..., None, None, :], align_corners=True).reshape(-1, 1)
+        # r_sampled = F.grid_sample(den_grid_r, pts_sample[None, ..., None, None, :], align_corners=True).reshape(-1, 1)
+        # g_sampled = F.grid_sample(den_grid_g, pts_sample[None, ..., None, None, :], align_corners=True).reshape(-1, 1)
+        # b_sampled = F.grid_sample(den_grid_b, pts_sample[None, ..., None, None, :], align_corners=True).reshape(-1, 1)
+        
+        
+        raw_flat_den[bbox_mask] = network_query_fn(pts, None,network_fn)
+        # if den_sampled.shape[0]>1:
+        #     pdb.set_trace()
+        raw_flat_den[bbox_mask,3] = den_sampled[...,0]
+        # raw_flat_den[bbox_mask,0] = r_sampled[...,0]
+        # raw_flat_den[bbox_mask,1] = g_sampled[...,0]
+        # raw_flat_den[bbox_mask,2] = b_sampled[...,0]
+        raw_flat_den=raw_flat_den.reshape(-1, 64, 4)
+        
+        
+        rgb_map, disp_map, acc_map, weights, depth_map, _, rgb_map_stack, acc_map_stack = raw2outputs([raw_flat_den], z_vals, rays_d)
+        
+        ret['rgb_map'] = rgb_map
+        ret['disp_map'] = disp_map
+        ret['acc_map'] = acc_map
+        return ret
+    elif render_vel:
+        ret = {}
+        N_rays = ray_batch.shape[0]
+        rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
+        time_step = ray_batch[0, -1]
+        bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
+        near, far = bounds[...,0], bounds[...,1] # [-1,1]
+
+        t_vals = torch.linspace(0., 1., steps=N_samples)
+        z_vals = near * (1.-t_vals) + far * (t_vals)
+
+        z_vals = z_vals.expand([N_rays, N_samples])
+        pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+        pts = torch.cat([pts, time_step * torch.ones((pts.shape[0], pts.shape[1], 1))], -1)  # [..., 4]
+        pts_flat = torch.reshape(pts, [-1, 4])
+        
+        # import pdb
+        # pdb.set_trace()
+        bbox_mask = bbox_model.insideMask(pts_flat[..., :3], to_float=False)
+        if bbox_mask.sum() == 0:
+            bbox_mask[0] = True  # in case zero rays are inside the bbox
+        # bbox_mask = torch.ones_like(bbox_mask)
+        pts = pts_flat[bbox_mask]
+        
+        out_dim = 3
+        raw_flat_vel = torch.zeros([N_rays, N_samples, out_dim]).reshape(-1, out_dim)
+        # import pdb
+        # pdb.set_trace()
+        raw_flat_vel[bbox_mask] = network_query_fn_vel(pts)  # raw_vel
+        raw_vel = raw_flat_vel.reshape(N_rays, N_samples, out_dim)
+        out_dim = 1
+        raw_flat_den = torch.zeros([N_rays, N_samples, out_dim]).reshape(-1, out_dim)
+        # pdb.set_trace()
+        raw_flat_den[bbox_mask] = network_query_fn(pts, None, network_fn)[...,[-1]]  # raw_den
+        raw_den = raw_flat_den.reshape(N_rays, N_samples, out_dim)
+        raw = torch.cat([raw_vel, raw_den], -1)
+        rgb_map, disp_map, acc_map, weights, depth_map, _, rgb_map_stack, acc_map_stack = raw2outputs([raw], z_vals, rays_d, render_vel=True)
+        vel_map = rgb_map[..., :2]
+        ret['vel_map'] = vel_map
+    else:
+        ret={}
+    # elif render_vel:
+    #     out_dim = 3
+    #     raw_flat_vel = torch.zeros([N_rays, N_samples, out_dim]).reshape(-1, out_dim)
+    #     raw_flat_vel[bbox_mask] = network_query_fn_vel(pts)[0]  # raw_vel
+    #     raw_vel = raw_flat_vel.reshape(N_rays, N_samples, out_dim)
+    #     out_dim = 1
+    #     raw_flat_den = torch.zeros([N_rays, N_samples, out_dim]).reshape(-1, out_dim)
+    #     raw_flat_den[bbox_mask] = network_query_fn(pts)  # raw_den
+    #     raw_den = raw_flat_den.reshape(N_rays, N_samples, out_dim)
+    #     raw = torch.cat([raw_vel, raw_den], -1)
+    #     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, render_vel=render_vel)
+    #     vel_map = rgb_map[..., :2]
+    #     ret['vel_map'] = vel_map
+    #     return ret
+    
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     rays_t, viewdirs = None, None
@@ -493,7 +671,7 @@ def render_rays(ray_batch,
         viewdirs = ray_batch[:, -4:-1] if ray_batch.shape[-1] > 9 else None
     elif ray_batch.shape[-1] > 8:
         viewdirs = ray_batch[:,-3:]
-
+    
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
@@ -622,8 +800,11 @@ def render_rays(ray_batch,
         # raw = run_network(pts, fn=run_fn)
         # raw = network_query_fn(pts, viewdirs, run_fn)
         # rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+    import pdb
+    # pdb.set_trace()
+    ret['rgb_map'] = rgb_map
+    ret['disp_map'] = disp_map
+    ret['acc_map'] =acc_map
     if retraw:
         ret['raw'] = raw[0]
         if raw[1] is not None:
