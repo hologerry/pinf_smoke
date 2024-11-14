@@ -44,7 +44,7 @@ def pose_spherical(theta, phi, radius, rotZ=True, wx=0.0, wy=0.0, wz=0.0):
     return c2w
 
 
-def load_real_capture_frame_data(basedir, half_res=False):
+def load_real_capture_frame_data(basedir, half_res=False, test_view=2):
     # frame data
     all_imgs = []
     all_poses = []
@@ -60,16 +60,16 @@ def load_real_capture_frame_data(basedir, half_res=False):
         meta = json.load(fp)
     near = float(meta["near"]) / 2.0
     far = float(meta["far"]) * 2.0
-    radius = (near + far) * 0.5
-    phi = 20.0
-    rotZ = False
-    r_center = np.array([0.3382070094283088, 0.38795384153014023, -0.2609209839653898]).astype(np.float32)
+    # radius = (near + far) * 0.5
+    # phi = 20.0
+    # rotZ = False
+    # r_center = np.array([0.3382070094283088, 0.38795384153014023, -0.2609209839653898]).astype(np.float32)
 
     # read scene data
     # x,y,z
     voxel_tran = np.array(
         [
-            [0.0, 0.0, 1.0, -0.081816665828228],
+            [0.0, 0.0, 1.0, -0.21816665828228],
             [0.0, 1.0, 0.0, -0.044627271592617035 * 5.0],
             [-1.0, 0.0, 0.0, -0.004908999893814325],
             [0.0, 0.0, 0.0, 1.0],
@@ -77,14 +77,14 @@ def load_real_capture_frame_data(basedir, half_res=False):
     )
     # swap_zx
     voxel_tran = np.stack([voxel_tran[:, 2], voxel_tran[:, 1], voxel_tran[:, 0], voxel_tran[:, 3]], axis=1)
-    voxel_scale = np.broadcast_to([0.4909 * 2.0, 0.73635 * 2.0, 0.4909 * 2.0], [3])
+    voxel_scale = np.broadcast_to([0.4909 * 2.5, 0.73635 * 2.0, 0.4909 * 2.0], [3])
 
     # read video frames
     # all videos should be synchronized, having the same frame_rate and frame_num
 
     frames = meta["frames"]
 
-    target_cam_names_dict = {"train": ["2"], "val": ["2"], "test": ["2"]}
+    target_cam_names_dict = {"train": ["2"], "val": [f"{test_view}"], "test": [f"{test_view}"]}
     frame_nums = 120
     if "red" in basedir.lower():
         print("red")
@@ -163,13 +163,13 @@ def load_real_capture_frame_data(basedir, half_res=False):
     hwfs = np.concatenate(all_hwf, 0)
 
     # set render settings:
-    sp_n = 40  # an even number!
-    sp_poses = [
-        pose_spherical(angle, phi, radius, rotZ, r_center[0], r_center[1], r_center[2])
-        for angle in np.linspace(-180, 180, sp_n + 1)[:-1]
-    ]
-    render_poses = torch.stack(sp_poses, 0)  # [sp_poses[36]]*sp_n, for testing a single pose
-    render_timesteps = np.arange(sp_n) / (sp_n - 1)
+    # sp_n = 40  # an even number!
+    # sp_poses = [
+    #     pose_spherical(angle, phi, radius, rotZ, r_center[0], r_center[1], r_center[2])
+    #     for angle in np.linspace(-180, 180, sp_n + 1)[:-1]
+    # ]
+    # render_poses = torch.stack(sp_poses, 0)  # [sp_poses[36]]*sp_n, for testing a single pose
+    # render_timesteps = np.arange(sp_n) / (sp_n - 1)
     bkg_color = np.array([0.0, 0.0, 0.0])
 
     return (
@@ -177,8 +177,6 @@ def load_real_capture_frame_data(basedir, half_res=False):
         poses,
         time_steps,
         hwfs,
-        render_poses,
-        render_timesteps,
         i_split,
         t_info,
         voxel_tran,

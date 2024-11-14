@@ -35,7 +35,7 @@ def pose_spherical(theta, phi, radius, rotZ=True, wx=0.0, wy=0.0, wz=0.0):
     return c2w
 
 
-def load_pinf_frame_data(basedir, half_res="normal", testskip=1):
+def load_pinf_frame_data(basedir, half_res="normal", testskip=1, test_view=2):
     # frame data
     all_imgs = []
     all_poses = []
@@ -82,7 +82,7 @@ def load_pinf_frame_data(basedir, half_res="normal", testskip=1):
         video_list = meta[s + "_videos"]
         video_list = video_list[0:1]
         if s == "test":
-            video_list = video_list[2:3]
+            video_list = video_list[test_view:test_view + 1]
 
         for train_video in video_list:
             imgs = []
@@ -157,23 +157,23 @@ def load_pinf_frame_data(basedir, half_res="normal", testskip=1):
     hwfs = np.concatenate(all_hwf, 0)  # n, 3
 
     # set render settings:
-    render_focal = float(hwfs[0][-1])
-    sp_n = 40  # an even number!
-    sp_poses = [
-        pose_spherical(angle, phi, radius, rotZ, r_center[0], r_center[1], r_center[2])
-        for angle in np.linspace(-180, 180, sp_n + 1)[:-1]
-    ]
-    sp_steps = np.linspace(t_info[0], t_info[1], num=sp_n)  # [ float(ct) ]*sp_n, for testing a frozen t
-    render_poses = torch.stack(sp_poses, 0)  # [sp_poses[36]]*sp_n, for testing a single pose
-    render_timesteps = np.reshape(sp_steps, (-1, 1))
+    # render_focal = float(hwfs[0][-1])
+    # sp_n = 40  # an even number!
+    # sp_poses = [
+    #     pose_spherical(angle, phi, radius, rotZ, r_center[0], r_center[1], r_center[2])
+    #     for angle in np.linspace(-180, 180, sp_n + 1)[:-1]
+    # ]
+    # sp_steps = np.linspace(t_info[0], t_info[1], num=sp_n)  # [ float(ct) ]*sp_n, for testing a frozen t
+    # render_poses = torch.stack(sp_poses, 0)  # [sp_poses[36]]*sp_n, for testing a single pose
+    # render_timesteps = np.reshape(sp_steps, (-1, 1))
 
     return (
         imgs,
         poses,
         time_steps,
         hwfs,
-        render_poses,
-        render_timesteps,
+        # render_poses,
+        # render_timesteps,
         i_split,
         t_info,
         voxel_tran,

@@ -47,6 +47,11 @@ def pinf_train(parser, args):
     basedir = args.basedir
     expname = args.expname
     logdir = save_log(basedir, expname)
+    if args.render_only:
+        test_view = 0
+    else:
+        test_view = 2
+    print(f"Test view: {test_view}")
 
     # Load data
     if "scalar" in args.datadir.lower():
@@ -55,8 +60,6 @@ def pinf_train(parser, args):
             poses,
             time_steps,
             hwfs,
-            render_poses,
-            render_timesteps,
             i_split,
             t_info,
             voxel_tran,
@@ -66,13 +69,12 @@ def pinf_train(parser, args):
             far,
         ) = load_pinf_frame_data(args.datadir, args.half_res, args.testskip)
     else:
+
         (
             images,
             poses,
             time_steps,
             hwfs,
-            render_poses,
-            render_timesteps,
             i_split,
             t_info,
             voxel_tran,
@@ -80,7 +82,7 @@ def pinf_train(parser, args):
             bkg_color,
             near,
             far,
-        ) = load_real_capture_frame_data(args.datadir, args.half_res)
+        ) = load_real_capture_frame_data(args.datadir, args.half_res, test_view=test_view)
 
     voxel_tran_inv = np.linalg.inv(voxel_tran)
     # print("Loaded pinf frame data", images.shape, render_poses.shape, hwfs[0], args.datadir)
@@ -144,8 +146,6 @@ def pinf_train(parser, args):
         model_fading_update(all_models, start, tempoInStep, velInStep, args.net_model == "hybrid")
 
     # Move testing data to GPU
-    render_poses = torch.Tensor(render_poses).cuda()
-    render_timesteps = torch.Tensor(render_timesteps).cuda()
     test_bkg_color = np.float32([0.0, 0.0, 0.3])
 
     # Move to GPU, except images
@@ -162,12 +162,11 @@ def pinf_train(parser, args):
             hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
             # the path rendering can be very slow.
 
-            i_render = i_test
-            images_test = images[i_render]
-            render_poses_test = poses[i_render]
-            hwf = hwfs[i_render[0]]
+            images_test = images[i_test]
+            poses_test = poses[i_test]
+            hwf = hwfs[i_test[0]]
             hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
-            K = Ks[i_render[0]]
+            K = Ks[i_test[0]]
             N_timesteps = images_test.shape[0]
             test_timesteps = torch.arange(N_timesteps) / (N_timesteps - 1.0)
             render_kwargs_test.update(network_query_fn_vel=vel_model)
@@ -176,10 +175,9 @@ def pinf_train(parser, args):
                 basedir, expname, "renderonly_{}_{:06d}".format("test" if args.render_test else "path", start + 1)
             )
             os.makedirs(testsavedir, exist_ok=True)
-            # print("test poses shape", render_poses.shape)
             render_kwargs_test["network_query_fn_vel"] = vel_model
-            rgbs, _ = render_path(
-                render_poses,
+            render_path(
+                poses_test,
                 hwf,
                 K,
                 args.chunk,
@@ -187,7 +185,7 @@ def pinf_train(parser, args):
                 gt_imgs=images,
                 savedir=testsavedir,
                 render_factor=args.render_factor,
-                render_steps=render_timesteps,
+                render_steps=test_timesteps,
                 bbox_model=bbox_model,
                 render_vel=True,
                 bkgd_color=test_bkg_color,
@@ -658,7 +656,7 @@ def pinf_train(parser, args):
         #####           end            #####
 
         # Rest is logging
-        if i % args.i_weights == 0:
+        if i % args.i_weights == 0 or i == 1000:
             path = os.path.join(basedir, expname, "{:06d}.tar".format(i))
             save_dic = {
                 "global_step": global_step,
@@ -681,7 +679,7 @@ def pinf_train(parser, args):
             torch.save(save_dic, path)
             print("Saved checkpoints at", path)
 
-        if i % args.i_testset == 0 and i > 0:
+        if (i % args.i_testset == 0 or i == 1000) and i > 0:
             testsavedir = os.path.join(basedir, expname, "testset_{:06d}".format(i))
             os.makedirs(testsavedir, exist_ok=True)
             with torch.no_grad():
@@ -700,22 +698,22 @@ def pinf_train(parser, args):
                 )
             print("Saved test set")
 
-        if i % args.i_video == 0 and i > 0:
-            with torch.no_grad():
-                hwf = hwfs[0]
-                hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
+        if (i % args.i_video == 0 or i == 1000) and i > 0:
+            pass
+            # with torch.no_grad():
+                # hwf = hwfs[0]
+                # hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
                 # the path rendering can be very slow.
 
-
-                i_render = i_test
-                images_test = images[i_render]
-                render_poses_test = poses[i_render]
-                hwf = hwfs[i_render[0]]
-                hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
-                K = Ks[i_render[0]]
-                N_timesteps = images_test.shape[0]
-                test_timesteps = torch.arange(N_timesteps) / (N_timesteps - 1.0)
-                render_kwargs_test.update(network_query_fn_vel=vel_model)
+                # i_render = i_test
+                # images_test = images[i_render]
+                # render_poses_test = poses[i_render]
+                # hwf = hwfs[i_render[0]]
+                # hwf = [int(hwf[0]), int(hwf[1]), float(hwf[2])]
+                # K = Ks[i_render[0]]
+                # N_timesteps = images_test.shape[0]
+                # test_timesteps = torch.arange(N_timesteps) / (N_timesteps - 1.0)
+                # render_kwargs_test.update(network_query_fn_vel=vel_model)
                 # rgbs, disps = render_path(
                 #     render_poses_test,
                 #     hwf,

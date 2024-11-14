@@ -1,5 +1,5 @@
 expname = pinf_0_blue_correct_bbox
-basedir = ./logs
+basedir = /data/Dynamics/PINF_logs
 
 ### data info
 datadir = /data/Dynamics/RealCaptureBlackBlueCloudOneData
