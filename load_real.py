@@ -58,25 +58,26 @@ def load_real_capture_frame_data(basedir, half_res=False):
     with open(os.path.join(basedir, "transforms_aligned.json"), "r") as fp:
         # read render settings
         meta = json.load(fp)
-    near = float(meta["near"])
-    far = float(meta["far"])
+    near = float(meta["near"]) / 2.0
+    far = float(meta["far"]) * 2.0
     radius = (near + far) * 0.5
     phi = 20.0
     rotZ = False
     r_center = np.array([0.3382070094283088, 0.38795384153014023, -0.2609209839653898]).astype(np.float32)
 
     # read scene data
+    # x,y,z
     voxel_tran = np.array(
         [
-            [0.0, 0.0, 1.0, 0.081816665828228],
-            [0.0, 1.0, 0.0, -0.044627271592617035],
+            [0.0, 0.0, 1.0, -0.081816665828228],
+            [0.0, 1.0, 0.0, -0.044627271592617035 * 5.0],
             [-1.0, 0.0, 0.0, -0.004908999893814325],
             [0.0, 0.0, 0.0, 1.0],
         ]
     )
     # swap_zx
     voxel_tran = np.stack([voxel_tran[:, 2], voxel_tran[:, 1], voxel_tran[:, 0], voxel_tran[:, 3]], axis=1)
-    voxel_scale = np.broadcast_to([0.4909, 0.73635, 0.4909], [3])
+    voxel_scale = np.broadcast_to([0.4909 * 2.0, 0.73635 * 2.0, 0.4909 * 2.0], [3])
 
     # read video frames
     # all videos should be synchronized, having the same frame_rate and frame_num

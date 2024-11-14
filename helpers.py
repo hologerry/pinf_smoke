@@ -1779,8 +1779,6 @@ class BBox_Tool(object):
         return pts_world
 
     def isInside(self, inputs_pts):
-        import pdb
-
         target_pts = pos_world2smoke(inputs_pts, self.s_w2s, self.s_scale)
         above = torch.logical_and(target_pts[..., 0] >= self.s_min[0], target_pts[..., 1] >= self.s_min[1])
         above = torch.logical_and(above, target_pts[..., 2] >= self.s_min[2])

@@ -172,42 +172,42 @@ def pinf_train(parser, args):
             test_timesteps = torch.arange(N_timesteps) / (N_timesteps - 1.0)
             render_kwargs_test.update(network_query_fn_vel=vel_model)
 
-            # testsavedir = os.path.join(
-            #     basedir, expname, "renderonly_{}_{:06d}".format("test" if args.render_test else "path", start + 1)
-            # )
-            # os.makedirs(testsavedir, exist_ok=True)
-            # # print("test poses shape", render_poses.shape)
-            # render_kwargs_test["network_query_fn_vel"] = vel_model
-            # rgbs, _ = render_path(
-            #     render_poses,
-            #     hwf,
-            #     K,
-            #     args.chunk,
-            #     render_kwargs_test,
-            #     gt_imgs=images,
-            #     savedir=testsavedir,
-            #     render_factor=args.render_factor,
-            #     render_steps=render_timesteps,
-            #     bbox_model=bbox_model,
-            #     render_vel=True,
-            #     bkgd_color=test_bkg_color,
-            # )
-            # print("Done rendering", testsavedir)
-            # # imageio.mimwrite(os.path.join(testsavedir, "video.mp4"), to8b(rgbs), fps=30, quality=8)
-
-            testsavedir = os.path.join(basedir, expname, "renderonly_future_{:06d}".format(start + 1))
+            testsavedir = os.path.join(
+                basedir, expname, "renderonly_{}_{:06d}".format("test" if args.render_test else "path", start + 1)
+            )
             os.makedirs(testsavedir, exist_ok=True)
-
-            render_future_pred(
-                render_poses_test,
+            # print("test poses shape", render_poses.shape)
+            render_kwargs_test["network_query_fn_vel"] = vel_model
+            rgbs, _ = render_path(
+                render_poses,
                 hwf,
                 K,
-                test_timesteps,
-                testsavedir,
-                images_test,
-                bbox_model,
-                **render_kwargs_test,
+                args.chunk,
+                render_kwargs_test,
+                gt_imgs=images,
+                savedir=testsavedir,
+                render_factor=args.render_factor,
+                render_steps=render_timesteps,
+                bbox_model=bbox_model,
+                render_vel=True,
+                bkgd_color=test_bkg_color,
             )
+            print("Done rendering", testsavedir)
+            # imageio.mimwrite(os.path.join(testsavedir, "video.mp4"), to8b(rgbs), fps=30, quality=8)
+
+            # testsavedir = os.path.join(basedir, expname, "renderonly_future_{:06d}".format(start + 1))
+            # os.makedirs(testsavedir, exist_ok=True)
+
+            # render_future_pred(
+            #     render_poses_test,
+            #     hwf,
+            #     K,
+            #     test_timesteps,
+            #     testsavedir,
+            #     images_test,
+            #     bbox_model,
+            #     **render_kwargs_test,
+            # )
 
             return
 
@@ -727,33 +727,33 @@ def pinf_train(parser, args):
                 #     render_vel=False,
                 # )
 
-                testsavedir = os.path.join(basedir, expname, "run_advect_den_{:06d}".format(i))
-                os.makedirs(testsavedir, exist_ok=True)
+                # testsavedir = os.path.join(basedir, expname, "run_advect_den_{:06d}".format(i))
+                # os.makedirs(testsavedir, exist_ok=True)
 
-                render_advect_den(
-                    render_poses_test,
-                    hwf,
-                    K,
-                    test_timesteps,
-                    testsavedir,
-                    images_test,
-                    bbox_model,
-                    **render_kwargs_test,
-                )
+                # render_advect_den(
+                #     render_poses_test,
+                #     hwf,
+                #     K,
+                #     test_timesteps,
+                #     testsavedir,
+                #     images_test,
+                #     bbox_model,
+                #     **render_kwargs_test,
+                # )
 
-                testsavedir = os.path.join(basedir, expname, "run_future_{:06d}".format(i))
-                os.makedirs(testsavedir, exist_ok=True)
+                # testsavedir = os.path.join(basedir, expname, "run_future_{:06d}".format(i))
+                # os.makedirs(testsavedir, exist_ok=True)
 
-                render_future_pred(
-                    render_poses_test,
-                    hwf,
-                    K,
-                    test_timesteps,
-                    testsavedir,
-                    images_test,
-                    bbox_model,
-                    **render_kwargs_test,
-                )
+                # render_future_pred(
+                #     render_poses_test,
+                #     hwf,
+                #     K,
+                #     test_timesteps,
+                #     testsavedir,
+                #     images_test,
+                #     bbox_model,
+                #     **render_kwargs_test,
+                # )
 
                 # print('Done, saving', rgbs.shape, disps.shape)
             # moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
